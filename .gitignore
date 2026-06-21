@@ -1,6 +1,13 @@
 # Arduino compile outputs & builds
 build/
 bin/
+.pio/
+.pioenvs/
+.clangd/
+.cache/
+ipch/
+
+# Binary files
 *.o
 *.a
 *.so
@@ -8,6 +15,10 @@ bin/
 *.dll
 *.elf
 *.hex
+*.bin
+*.map
+*.eep
+*.lst
 
 # Editor / IDE configuration
 .vscode/
@@ -19,6 +30,11 @@ bin/
 
 # OS generated files
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
 Thumbs.db
 
 # Temporary files & backups
