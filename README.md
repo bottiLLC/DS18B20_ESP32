@@ -1,0 +1,125 @@
+# DS18B20 Arduino Library for ESP32-C3
+
+ESP32-C3のRMT（Remote Control）周辺機能を使用した、FreeRTOS向け非ブロッキング 1-Wire DS18B20温度センサーライブラリです。
+
+## 概要
+本ライブラリは、ESP32-C3 などの FreeRTOS 環境において、温度変換（約750ms）に伴う待機時間を非ブロッキングで処理（`vTaskDelay` を利用）し、CPUリソースを他のタスクに解放することで、マルチタスク制御との親和性を高めたライブラリです。
+また、堅牢性を重視し、バスの異常検知（GNDショート、断線、3線モードのVDD浮き）や、電源寸断による85℃固着（POR）状態を識別できる強力な自己診断機能を備えています。
+
+## 公式データシート・製品情報
+* **アナログ・デバイセズ（旧ダラス・マキシム）公式製品ページ**:
+  [https://www.analog.com/jp/products/ds18b20.html](https://www.analog.com/jp/products/ds18b20.html)
+  ※データシートや詳細な技術仕様は上記の公式サイトからご確認ください。
+
+## 主な特徴
+1. **FreeRTOS 非ブロッキング設計**:
+   * 温度変換の待機中（最大750ms以上）、`vTaskDelay()` を用いることでタスクをブロック状態にし、他の優先タスク（Wi-Fi、Bluetooth、UI処理など）の実行を妨げません。
+2. **OneWireNg バックエンド**:
+   * RMT をフルサポートする信頼性の高い `OneWireNg` ライブラリをベースに構築されています。
+3. **自己診断およびエラー検知**:
+   * **3線式（外部電源モード）確認**: センサーが安定した外部電源で動作しているかをチェックし、VDDの断線や接触不良（寄生電源モードへの望まないフォールバック）を検出します。
+   * **GNDショート検知**: バスがGNDとショートしている状態を識別します。
+   * **断線・プルアップ抜け検知**: センサーが外れている、またはプルアップ抵抗が抜けている状態を識別します。
+   * **85℃固着（POR）検出**: 電源投入時初期値である `85℃` のまま値が変化しない不具合を検出し、リセットがかかった形跡を追跡します。
+
+## 依存関係
+本ライブラリは以下のライブラリに依存しています。事前にインストールしてください。
+* **OneWireNg** (Arduinoライブラリマネージャーよりインストール可能)
+
+## 回路図（推奨接続）
+本ライブラリは**3線式（外部電源モード）専用設計**です。
+```text
+      [ESP32-C3]                   [DS18B20]
+       GPIO Pin (例: 4) <----------> DQ (2pin)
+                                     |
+                                  [4.7kΩ Pull-up]
+                                     |
+       3.3V / 5.0V      <-----------> VDD (3pin)
+       GND              <-----------> GND (1pin)
+```
+
+## クイックスタート
+
+```cpp
+#include <DS18B20.h>
+
+#define ONE_WIRE_BUS_PIN 4  // 1-Wireバス接続GPIO
+
+DS18B20 sensor(ONE_WIRE_BUS_PIN);
+
+void setup() {
+    Serial.begin(115200);
+    
+    // センサーの初期化とスキャン
+    if (sensor.begin()) {
+        Serial.printf("%d台のセンサーを検出しました。\n", sensor.getDeviceCount());
+    } else {
+        Serial.println("センサーが見つかりません。");
+    }
+}
+
+void loop() {
+    // 1. 温度変換開始（非同期）
+    if (sensor.startConversion()) {
+        
+        // 12bit解像度の変換時間（750ms）を待機（RTOSタスクの場合は vTaskDelay を推奨）
+        delay(780); 
+        
+        // 2. 温度データの読み取り
+        for (int i = 0; i < sensor.getDeviceCount(); i++) {
+            float temp = 0.0f;
+            if (sensor.readTemperature(i, temp)) {
+                Serial.printf("センサー [%d]: %.2f ℃\n", i, temp);
+            } else {
+                // エラーコードの取得
+                DS18B20::ErrorType err = sensor.getLastError(i);
+                Serial.printf("エラー [%d]: %s (Code: %d)\n", 
+                              i, DS18B20::getErrorString(err), err);
+            }
+        }
+    }
+    delay(2000);
+}
+```
+
+## 主要APIリファレンス
+
+### `DS18B20` クラス
+
+#### メソッド
+
+* **`DS18B20(uint8_t pin)`**
+  * コンストラクタ。1-Wireバスに使用するGPIOピン番号を指定します。
+* **`bool begin()`**
+  * バスおよびセンサーを初期化し、接続されているデバイスをスキャンします。成功した場合は `true` を返します。
+* **`bool startConversion()`**
+  * 接続されているすべてのDS18B20に対し、一括で温度変換の開始コマンド（Convert T）を送信します。
+* **`bool readTemperature(int romIndex, float &tempCelsius)`**
+  * 指定したインデックス（`0` 〜 `getDeviceCount()-1`）のセンサーからデータを読み込み、参照引数 `tempCelsius` に結果を代入します。成功した場合は `true` を返します。
+* **`bool readAllTemperatures(float *tempArray)`**
+  * バス上の全センサーから一括で温度を読み取り、配列に格納します（ブロッキング・vTaskDelay内蔵）。
+* **`int getDeviceCount() const`**
+  * スキャンによって検出されたセンサーの総数を返します（最大 8 台）。
+* **`bool checkPowerSupply()`**
+  * 接続されたセンサーが外部電源（3線モード）で動作しているかチェックします。もし1台でも寄生電源で動作している（VDDが未接続・浮いているなど）場合は `false` を返します。
+* **`ErrorType getLastError(int romIndex) const`**
+  * 指定したインデックスのセンサーの直近のエラーコードを取得します。
+* **`static const char* getErrorString(ErrorType err)`**
+  * エラーコード（`ErrorType`）を人間が読める日本語のエラー説明文字列に変換します。
+
+#### エラーコード (`ErrorType`)
+
+| エラー名 | 値 | 説明 |
+| :--- | :---: | :--- |
+| `ERR_NONE` | 0 | 正常終了。エラーはありません。 |
+| `ERR_NOT_FOUND` | 1 | 該当インデックスのデバイスが見つかりません。 |
+| `ERR_BUS_RESET` | 2 | 1-Wireバスのリセットパルスに対するプレゼンスパルスがありません。 |
+| `ERR_MATCH_ROM` | 3 | ROMコードの選択および照合に失敗しました。 |
+| `ERR_SHORT_GND` | 4 | バスの信号線がGNDにショート（全0x00データを受信）しています。 |
+| `ERR_DISCONNECTED` | 5 | 断線またはプルアップ抵抗の欠落（全0xFFデータを受信）しています。 |
+| `ERR_CRC` | 6 | 受信したスクラッチパッドのCRCチェックに失敗しました。 |
+| `ERR_STUCK_85C` | 7 | 電源投入時の初期値である 85.0℃ が検出されました。正常に温度変換が完了していない、または計測中にリセットされた可能性があります。 |
+| `ERR_PARASITE_POWER` | 8 | 外部電源ライン（VDD）が断線・接触不良のため、寄生電源で動作しています。 |
+
+## サンプルプログラム
+`examples/ComprehensiveDemo/ComprehensiveDemo.ino` に、FreeRTOSタスクを生成して並行して動作させる包括的なデモが用意されています。
