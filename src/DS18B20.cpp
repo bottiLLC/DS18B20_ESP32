@@ -148,8 +148,8 @@ bool DS18B20::ow_reset_with_diagnosis(ErrorType &busError) {
     uint8_t presence = digitalRead(_pin);
     portEXIT_CRITICAL(&owMux);
     
-    // 5. リセットパルスのタイムスロット完了まで待機 (残り340us)
-    delayMicroseconds(340);
+    // 5. リセットパルスのタイムスロット完了まで待機 (残り410us)
+    delayMicroseconds(410);
     
     if (presence != 0) {
         // LOWに引くデバイスが存在しない ＝ センサー未接続または信号線断線
@@ -225,6 +225,9 @@ bool DS18B20::search(DeviceAddress &address, SearchState &state) {
                 ow_write_bit(search_direction);
 
                 id_bit_number++;
+                if (id_bit_number >= 65) {
+                    break;
+                }
                 rom_byte_mask <<= 1;
 
                 if (rom_byte_mask == 0) {
@@ -568,16 +571,17 @@ void DS18B20::getDeviceAddress(int romIndex, DeviceAddress destAddress) const {
 }
 
 float DS18B20::calculateTemperature(uint8_t lsb, uint8_t msb, uint8_t cfg) {
-    int16_t raw = (msb << 8) | lsb;
+    uint16_t raw_u = (msb << 8) | lsb;
 
     uint8_t res = (cfg >> 5) & 0x03;
     if (res == 0x00) {
-        raw &= ~0x07;
+        raw_u &= ~0x07;
     } else if (res == 0x01) {
-        raw &= ~0x03;
+        raw_u &= ~0x03;
     } else if (res == 0x02) {
-        raw &= ~0x01;
+        raw_u &= ~0x01;
     }
 
+    int16_t raw = (int16_t)raw_u;
     return (float)raw / 16.0f;
 }
