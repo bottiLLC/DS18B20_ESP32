@@ -7,8 +7,9 @@
  * @brief DS18B20 / DS18B20U+ 専用の温度測定管理クラス (ESP32-C3・3線式専用)
  * 
  * FreeRTOS環境において、タイミングの精密なGPIO制御を行い、
- * 温度変換待ち時間（750ms）に vTaskDelay() を用いて他のタスクを動作させます。
+ * 温度変換待ち時間に vTaskDelay() を用いて他のタスクを動作させます。
  * バスの異常検知機能、電源断検出機能を内蔵しています。
+ * 外部ライブラリを一切使用しない、完全自己完結型の実装です。
  */
 class DS18B20 {
 public:
@@ -39,6 +40,12 @@ public:
     bool startConversion();
 
     /**
+     * @brief 温度変換が完了しているかポーリング確認する (3線式・外部電源モード専用機能)
+     * @return 変換が完了している場合 true
+     */
+    bool isConversionComplete();
+
+    /**
      * @brief バス上で発見された指定インデックスのデバイスの温度データを読み取る
      * 
      * @param romIndex 発見されたデバイスのインデックス (0 〜 getDeviceCount()-1)
@@ -48,7 +55,7 @@ public:
     bool readTemperature(int romIndex, float &tempCelsius);
 
     /**
-     * @brief バス上で発見された全デバイスの温度データを一括で読み取る (ブロッキング・vTaskDelay内蔵)
+     * @brief バス上で発見された全デバイスの温度データを一括で読み取る (ブロッキング・動的ポーリング待機)
      * @param tempArray 温度結果を格納する float 配列 (要素数は getDeviceCount() 以上必要)
      * @return 少なくとも1つのデバイスから正常に読み取れた場合 true
      */
@@ -75,6 +82,22 @@ public:
      */
     bool checkPowerSupply();
 
+public:
+    enum ErrorType {
+        ERR_NONE = 0,
+        ERR_NOT_FOUND,
+        ERR_BUS_RESET,
+        ERR_MATCH_ROM,
+        ERR_SHORT_GND,          // 全0x00 / DQショート
+        ERR_DISCONNECTED,       // 全0xFF / 断線・プルアップ抵抗抜け
+        ERR_CRC,                // CRCエラー
+        ERR_STUCK_85C,          // 85℃初期値固定（未変換または電源寸断によるリセット）
+        ERR_PARASITE_POWER,     // 寄生電源検知（3線モードでのVDD未接続・浮き）
+        ERR_OUT_OF_RANGE,       // 測定限界範囲外 (-55℃〜+125℃)
+        ERR_MEM_CORRUPT,        // スクラッチパッドの予約領域・定義ビットの異常値検知
+        ERR_CONVERSION_TIMEOUT  // 温度変換のタイムアウト (800ms)
+    };
+
 private:
     // 1-Wire 探索状態管理構造体
     struct SearchState {
@@ -90,6 +113,7 @@ private:
     void ow_write_byte(uint8_t byte);
     uint8_t ow_read_byte();
     bool ow_reset();
+    bool ow_reset_with_diagnosis(ErrorType &busError);
     void ow_select(const DeviceAddress addr);
     void ow_skip();
     bool search(DeviceAddress &address, SearchState &state);
@@ -101,18 +125,6 @@ private:
     SemaphoreHandle_t _mutex;  // 複数タスクからのアクセスを保護するためのMutex
 
 public:
-    enum ErrorType {
-        ERR_NONE = 0,
-        ERR_NOT_FOUND,
-        ERR_BUS_RESET,
-        ERR_MATCH_ROM,
-        ERR_SHORT_GND,        // 全0x00
-        ERR_DISCONNECTED,     // 全0xFF
-        ERR_CRC,              // CRCエラー
-        ERR_STUCK_85C,        // 85℃初期値固定（未変換または電源寸断によるリセット）
-        ERR_PARASITE_POWER    // 寄生電源検知（3線モードでのVDD未接続・浮き）
-    };
-
     /**
      * @brief 指定したインデックスのデバイスの最後のエラーを取得する
      * @param romIndex デバイスインデックス

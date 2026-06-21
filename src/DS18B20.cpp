@@ -111,6 +111,55 @@ bool DS18B20::ow_reset() {
     return (presence == 1);
 }
 
+// 外部ライブラリ依存ゼロで全バス異常を判定するリセット診断ルーチン
+bool DS18B20::ow_reset_with_diagnosis(ErrorType &busError) {
+    busError = ERR_NONE;
+    
+    // 1. 事前のバスレベル確認（プルアップによりHIGHになっているはず）
+    pinMode(_pin, INPUT);
+    delayMicroseconds(10);
+    if (!digitalRead(_pin)) {
+        // すでにLOWになっている ＝ バスGNDショートの可能性
+        busError = ERR_SHORT_GND;
+        return false;
+    }
+
+    // 2. リセットパルスの送信 (LOW 480us)
+    pinMode(_pin, OUTPUT);
+    digitalWrite(_pin, LOW);
+    delayMicroseconds(480);
+    
+    // 3. リリースし、ピンの立ち上がりをタイミング保護下で確認
+    portENTER_CRITICAL(&owMux);
+    pinMode(_pin, INPUT);
+    
+    // デバイスがプレゼンスを送信し始める前のタイミング(10us後)で
+    // バスが一旦HIGHへ立ち上がったかを確認（これで永続的なGNDショートを検出）
+    delayMicroseconds(10);
+    if (!digitalRead(_pin)) {
+        portEXIT_CRITICAL(&owMux);
+        busError = ERR_SHORT_GND;
+        return false;
+    }
+    
+    // 4. プレゼンスパルス（デバイスがLOWに引く）のサンプリング
+    // リリース開始から合計70us後（すでに10us経過しているため残り60us）
+    delayMicroseconds(60); 
+    uint8_t presence = digitalRead(_pin);
+    portEXIT_CRITICAL(&owMux);
+    
+    // 5. リセットパルスのタイムスロット完了まで待機 (残り340us)
+    delayMicroseconds(340);
+    
+    if (presence != 0) {
+        // LOWに引くデバイスが存在しない ＝ センサー未接続または信号線断線
+        busError = ERR_DISCONNECTED;
+        return false;
+    }
+    
+    return true;
+}
+
 void DS18B20::ow_select(const DeviceAddress addr) {
     ow_write_byte(0x55); // Match ROM
     for (int i = 0; i < 8; i++) {
@@ -302,6 +351,20 @@ bool DS18B20::startConversion() {
     return false;
 }
 
+// 3線式での温度変換中ポーリング判定処理 (Convert T後のステータス確認)
+// 外部電源使用時、デバイスは温度変換中に 0 を出力し、完了すると 1 を出力し続けます。
+bool DS18B20::isConversionComplete() {
+    if (!_mutex) return false;
+    
+    bool complete = false;
+    if (xSemaphoreTake(_mutex, portMAX_DELAY) == pdTRUE) {
+        // リードタイムスロットを実行し、結果が1になれば完了
+        complete = (ow_read_bit() == 1);
+        xSemaphoreGive(_mutex);
+    }
+    return complete;
+}
+
 bool DS18B20::readTemperature(int romIndex, float &tempCelsius) {
     if (!_mutex || romIndex < 0 || romIndex >= _deviceCount) return false;
 
@@ -309,8 +372,10 @@ bool DS18B20::readTemperature(int romIndex, float &tempCelsius) {
     if (xSemaphoreTake(_mutex, portMAX_DELAY) == pdTRUE) {
         _lastErrors[romIndex] = ERR_NONE;
 
-        if (!ow_reset()) {
-            _lastErrors[romIndex] = ERR_BUS_RESET;
+        // 詳細なバス診断を伴うリセット
+        ErrorType busErr = ERR_NONE;
+        if (!ow_reset_with_diagnosis(busErr)) {
+            _lastErrors[romIndex] = busErr;
             xSemaphoreGive(_mutex);
             return false;
         }
@@ -323,7 +388,7 @@ bool DS18B20::readTemperature(int romIndex, float &tempCelsius) {
             scratchpad[i] = ow_read_byte();
         }
 
-        // バスのショート判定（全バイト 0x00 の場合、バスがGNDに短絡していると判定）
+        // バスのショート判定（全バイト 0x00 の場合）
         bool allZeros = true;
         for (int i = 0; i < 9; i++) {
             if (scratchpad[i] != 0x00) {
@@ -337,7 +402,7 @@ bool DS18B20::readTemperature(int romIndex, float &tempCelsius) {
             return false;
         }
 
-        // バスの断線または未接続判定（全バイト 0xFF の場合、バスが浮いているか切断されていると判定）
+        // バスの断線判定（全バイト 0xFF の場合）
         bool allOnes = true;
         for (int i = 0; i < 9; i++) {
             if (scratchpad[i] != 0xFF) {
@@ -351,16 +416,49 @@ bool DS18B20::readTemperature(int romIndex, float &tempCelsius) {
             return false;
         }
 
-        // データシート基準のCRC-8検証
+        // --- 全エラー検知：データシート仕様に基づくスクラッチパッド予約領域・整合性チェック ---
+        // 1. Byte 5 は Reserved (常に 0xFF) である必要があります
+        if (scratchpad[5] != 0xFF) {
+            _lastErrors[romIndex] = ERR_MEM_CORRUPT;
+            xSemaphoreGive(_mutex);
+            return false;
+        }
+        
+        // 2. Byte 7 は Reserved (常に 0x10) である必要があります
+        if (scratchpad[7] != 0x10) {
+            _lastErrors[romIndex] = ERR_MEM_CORRUPT;
+            xSemaphoreGive(_mutex);
+            return false;
+        }
+
+        // 3. Byte 4 (Configuration Register) の下位5ビットは常に 11111 (0x1F) である必要があります (Figure 10参照)
+        if ((scratchpad[4] & 0x1F) != 0x1F) {
+            _lastErrors[romIndex] = ERR_MEM_CORRUPT;
+            xSemaphoreGive(_mutex);
+            return false;
+        }
+
+        // 4. データシート基準のCRC-8検証
         if (calculateCRC8(scratchpad, 8) != scratchpad[8]) {
             _lastErrors[romIndex] = ERR_CRC;
             xSemaphoreGive(_mutex);
             return false;
         }
 
+        // スクラッチパッドから温度を算出
         tempCelsius = calculateTemperature(scratchpad[0], scratchpad[1], scratchpad[4]);
         
+        // 5. ハードウェア測定限界値（-55.0℃ 〜 +125.0℃）の範囲外判定
+        if (tempCelsius < -55.0f || tempCelsius > 125.0f) {
+            _lastErrors[romIndex] = ERR_OUT_OF_RANGE;
+            xSemaphoreGive(_mutex);
+            return false;
+        }
+
+        // 6. 85℃初期値固着 (未変換または電源寸断によるリセット検知)
         if (tempCelsius == 85.0f) {
+            // スクラッチパッドのバイト6（予約領域）は、パワーオンリセット初期状態では 0x0C となっています。
+            // これにより、実際の「測定環境が正常に85.0℃」なのか「リセットによる85.0℃」かを切り分けます。
             if (scratchpad[6] == 0x0C) {
                 if (_parasitePowerDetected) {
                     _lastErrors[romIndex] = ERR_PARASITE_POWER;
@@ -396,27 +494,58 @@ const char* DS18B20::getErrorString(ErrorType err) {
         case ERR_MATCH_ROM:
             return "Match ROM コマンド送信失敗";
         case ERR_SHORT_GND:
-            return "DQラインGNDショート検知 (全0x00)";
+            return "DQラインGNDショート検知 (全0x00 / 応答レベル低)";
         case ERR_DISCONNECTED:
-            return "断線または未接続 (全0xFF)";
+            return "断線または未接続 (全0xFF / プレゼンスパルスなし)";
         case ERR_CRC:
             return "CRCエラー (受信データ破損)";
         case ERR_STUCK_85C:
             return "85℃初期値固定エラー (未変換または電源寸断によるリセット)";
         case ERR_PARASITE_POWER:
             return "寄生電源検知 (3線モードでのVDD未接続・浮き)";
+        case ERR_OUT_OF_RANGE:
+            return "測定可能範囲外エラー (-55℃〜+125℃の範囲外値を検出)";
+        case ERR_MEM_CORRUPT:
+            return "スクラッチパッド破損・定義外ビット検出";
+        case ERR_CONVERSION_TIMEOUT:
+            return "温度変換タイムアウトエラー (3線式応答タイムアウト)";
         default:
             return "未知のエラー";
     }
 }
 
+// 3線式専用の動的な温度変換完了ポーリング待機処理
 bool DS18B20::readAllTemperatures(float *tempArray) {
     if (!tempArray || _deviceCount == 0) return false;
 
+    // 1. 温度変換開始
     if (!startConversion()) return false;
 
-    vTaskDelay(pdMS_TO_TICKS(780));
+    // 2. 最大800msの間、10msごとに完了ステータスをポーリング
+    // (通常、室温付近では750msよりも早く、およそ600ms〜700msで完了します)
+    int timeout_ms = 800;
+    int elapsed_ms = 0;
+    bool completed = false;
 
+    while (elapsed_ms < timeout_ms) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+        elapsed_ms += 10;
+        if (isConversionComplete()) {
+            completed = true;
+            break;
+        }
+    }
+
+    // タイムアウトした場合はエラーを設定
+    if (!completed) {
+        for (int i = 0; i < _deviceCount; i++) {
+            _lastErrors[i] = ERR_CONVERSION_TIMEOUT;
+            tempArray[i] = -999.0f;
+        }
+        return false;
+    }
+
+    // 3. 各センサーから順番にデータを読み出す
     bool atLeastOneSuccess = false;
     for (int i = 0; i < _deviceCount; i++) {
         float temp = -999.0f;
