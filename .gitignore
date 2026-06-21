@@ -1,0 +1,27 @@
+# Arduino compile outputs & builds
+build/
+bin/
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.elf
+*.hex
+
+# Editor / IDE configuration
+.vscode/
+.idea/
+*.suo
+*.user
+*.workspace
+*.code-workspace
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Temporary files & backups
+*.bak
+*~
+*.swp
