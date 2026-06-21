@@ -23,12 +23,13 @@ static uint8_t calculateCRC8(const uint8_t *data, size_t len) {
 }
 
 DS18B20::DS18B20(uint8_t pin) 
-    : _pin(pin), _deviceCount(0), _parasitePowerDetected(false) 
+    : _pin(pin), _deviceCount(0) 
 {
     // スレッド安全性のためのミューテックスを作成
     _mutex = xSemaphoreCreateMutex();
     for (int i = 0; i < MAX_DEVICES; i++) {
         _lastErrors[i] = ERR_NONE;
+        _parasitePowerDetected[i] = false;
     }
 }
 
@@ -41,19 +42,23 @@ DS18B20::~DS18B20() {
 // 1-Wire 低レベル通信関数
 
 void DS18B20::ow_write_bit(uint8_t bit) {
-    portENTER_CRITICAL(&owMux);
-    pinMode(_pin, OUTPUT);
-    digitalWrite(_pin, LOW);
     if (bit) {
+        portENTER_CRITICAL(&owMux);
+        pinMode(_pin, OUTPUT);
+        digitalWrite(_pin, LOW);
         delayMicroseconds(5);  // Write 1: LOW 5us
         pinMode(_pin, INPUT);  // リリース (プルアップでHIGH)
-        delayMicroseconds(55); // 残りの時間を待機
+        portEXIT_CRITICAL(&owMux);
+        delayMicroseconds(55); // 残りの時間は割り込みを許可して待機
     } else {
+        portENTER_CRITICAL(&owMux);
+        pinMode(_pin, OUTPUT);
+        digitalWrite(_pin, LOW);
         delayMicroseconds(60); // Write 0: LOW 60us
         pinMode(_pin, INPUT);  // リリース
-        delayMicroseconds(5);  // 回復時間
+        portEXIT_CRITICAL(&owMux);
+        delayMicroseconds(5);  // 回復時間は割り込みを許可して待機
     }
-    portEXIT_CRITICAL(&owMux);
 }
 
 uint8_t DS18B20::ow_read_bit() {
@@ -67,8 +72,8 @@ uint8_t DS18B20::ow_read_bit() {
     if (digitalRead(_pin)) {
         bit = 1;
     }
+    portEXIT_CRITICAL(&owMux); // サンプリング直後に割り込みを許可
     delayMicroseconds(48);     // タイムスロットの残りを待機 (合計60us)
-    portEXIT_CRITICAL(&owMux);
     return bit;
 }
 
@@ -91,24 +96,8 @@ uint8_t DS18B20::ow_read_byte() {
 }
 
 bool DS18B20::ow_reset() {
-    uint8_t presence = 0;
-    
-    // リセットパルス: LOW 480us
-    pinMode(_pin, OUTPUT);
-    digitalWrite(_pin, LOW);
-    delayMicroseconds(480);
-    
-    // バスをリリースしてデバイスの応答を待つ
-    portENTER_CRITICAL(&owMux);
-    pinMode(_pin, INPUT);
-    delayMicroseconds(70); // デバイスは15〜60us以内にDQをLOWに引くので、70us時点で確認
-    if (!digitalRead(_pin)) {
-        presence = 1;
-    }
-    portEXIT_CRITICAL(&owMux);
-    
-    delayMicroseconds(410); // 残りの復旧時間 (合計480us)
-    return (presence == 1);
+    ErrorType dummy;
+    return ow_reset_with_diagnosis(dummy);
 }
 
 // 外部ライブラリ依存ゼロで全バス異常を判定するリセット診断ルーチン
@@ -185,7 +174,6 @@ bool DS18B20::search(DeviceAddress &address, SearchState &state) {
         if (!ow_reset()) {
             state.last_discrepancy = 0;
             state.last_device_flag = false;
-            state.last_family_discrepancy = 0;
             return false;
         }
 
@@ -210,9 +198,6 @@ bool DS18B20::search(DeviceAddress &address, SearchState &state) {
 
                     if (search_direction == 0) {
                         last_zero = id_bit_number;
-                        if (last_zero < 9) {
-                            state.last_family_discrepancy = last_zero;
-                        }
                     }
                 }
 
@@ -249,7 +234,6 @@ bool DS18B20::search(DeviceAddress &address, SearchState &state) {
     if (!search_result || (state.rom_number[0] == 0)) {
         state.last_discrepancy = 0;
         state.last_device_flag = false;
-        state.last_family_discrepancy = 0;
         search_result = false;
     } else {
         for (int i = 0; i < 8; i++) {
@@ -260,220 +244,246 @@ bool DS18B20::search(DeviceAddress &address, SearchState &state) {
     return search_result;
 }
 
+bool DS18B20::begin_internal() {
+    _deviceCount = 0;
+    for (int i = 0; i < MAX_DEVICES; i++) {
+        _lastErrors[i] = ERR_NONE;
+        _parasitePowerDetected[i] = false;
+    }
+
+    // 初期状態でバスピンをプルアップの浮いた入力状態にする
+    pinMode(_pin, INPUT);
+
+    SearchState s_state;
+    memset(&s_state, 0, sizeof(SearchState));
+    s_state.last_discrepancy = 0;
+    s_state.last_device_flag = false;
+
+    DeviceAddress addr;
+
+    while (search(addr, s_state)) {
+        if (_deviceCount >= MAX_DEVICES) break;
+
+        // DS18B20ファミリーコード 0x28 の検証
+        // 自前の CRC-8 算出で ROM の整合性を検査
+        if (addr[0] == 0x28 && calculateCRC8(addr, 7) == addr[7]) {
+            memcpy(_devices[_deviceCount], addr, 8);
+            _lastErrors[_deviceCount] = ERR_NONE;
+            _deviceCount++;
+        }
+    }
+
+    // 各デバイスの電源供給モードを個別に確認
+    for (int i = 0; i < _deviceCount; i++) {
+        if (ow_reset()) {
+            ow_select(_devices[i]);
+            ow_write_byte(0xB4); // Read Power Supply コマンド
+            if (ow_read_bit() == 0) {
+                _parasitePowerDetected[i] = true;
+                _lastErrors[i] = ERR_PARASITE_POWER; // 初期診断時に寄生電源ならエラーをセット
+            } else {
+                _parasitePowerDetected[i] = false;
+            }
+        }
+    }
+
+    return (_deviceCount > 0);
+}
+
 bool DS18B20::begin() {
     if (!_mutex) return false;
-
+    bool success = false;
     if (xSemaphoreTake(_mutex, portMAX_DELAY) == pdTRUE) {
-        _deviceCount = 0;
-        _parasitePowerDetected = false;
-        for (int i = 0; i < MAX_DEVICES; i++) {
-            _lastErrors[i] = ERR_NONE;
-        }
-
-        // 初期状態でバスピンをプルアップの浮いた入力状態にする
-        pinMode(_pin, INPUT);
-
-        SearchState s_state;
-        memset(&s_state, 0, sizeof(SearchState));
-        s_state.last_discrepancy = 0;
-        s_state.last_device_flag = false;
-        s_state.last_family_discrepancy = 0;
-
-        DeviceAddress addr;
-
-        while (search(addr, s_state)) {
-            if (_deviceCount >= MAX_DEVICES) break;
-
-            // DS18B20ファミリーコード 0x28 の検証
-            // 自前の CRC-8 算出で ROM の整合性を検査
-            if (addr[0] == 0x28 && calculateCRC8(addr, 7) == addr[7]) {
-                memcpy(_devices[_deviceCount], addr, 8);
-                _lastErrors[_deviceCount] = ERR_NONE;
-                _deviceCount++;
-            }
-        }
-
-        // 電源供給モード（3線モード）の確認を行う
-        if (_deviceCount > 0) {
-            if (ow_reset()) {
-                ow_skip();
-                ow_write_byte(0xB4); // Read Power Supply コマンド
-                // 0が返ってきた場合は、少なくとも1台が寄生電源動作
-                if (ow_read_bit() == 0) {
-                    _parasitePowerDetected = true;
-                } else {
-                    _parasitePowerDetected = false;
-                }
-            }
-        }
-
+        success = begin_internal();
         xSemaphoreGive(_mutex);
-        return (_deviceCount > 0);
     }
-    return false;
+    return success;
+}
+
+bool DS18B20::checkPowerSupply_internal() {
+    bool allExternal = true;
+    for (int i = 0; i < _deviceCount; i++) {
+        if (ow_reset()) {
+            ow_select(_devices[i]);
+            ow_write_byte(0xB4);
+            if (ow_read_bit() == 0) {
+                _parasitePowerDetected[i] = true;
+                _lastErrors[i] = ERR_PARASITE_POWER;
+                allExternal = false;
+            } else {
+                _parasitePowerDetected[i] = false;
+            }
+        } else {
+            _lastErrors[i] = ERR_DISCONNECTED;
+            allExternal = false;
+        }
+    }
+    return allExternal;
 }
 
 bool DS18B20::checkPowerSupply() {
     if (!_mutex) return false;
-
-    bool allExternal = true;
+    bool allExternal = false;
     if (xSemaphoreTake(_mutex, portMAX_DELAY) == pdTRUE) {
-        if (ow_reset()) {
-            ow_skip();
-            ow_write_byte(0xB4);
-            if (ow_read_bit() == 0) {
-                _parasitePowerDetected = true;
-                allExternal = false;
-            } else {
-                _parasitePowerDetected = false;
-                allExternal = true;
-            }
-        } else {
-            allExternal = false;
-        }
+        allExternal = checkPowerSupply_internal();
         xSemaphoreGive(_mutex);
     }
     return allExternal;
 }
 
-bool DS18B20::startConversion() {
-    if (!_mutex) return false;
-
-    if (xSemaphoreTake(_mutex, portMAX_DELAY) == pdTRUE) {
-        if (!ow_reset()) {
-            xSemaphoreGive(_mutex);
-            return false;
+bool DS18B20::startConversion_internal() {
+    ErrorType busErr = ERR_NONE;
+    if (!ow_reset_with_diagnosis(busErr)) {
+        // バス診断失敗時はすべてのデバイスにエラーを設定
+        for (int i = 0; i < _deviceCount; i++) {
+            _lastErrors[i] = busErr;
         }
-
-        ow_skip();
-        ow_write_byte(0x44); // Convert T
-        
-        xSemaphoreGive(_mutex);
-        return true;
+        return false;
     }
-    return false;
+
+    ow_skip();
+    ow_write_byte(0x44); // Convert T
+    return true;
 }
 
-// 3線式での温度変換中ポーリング判定処理 (Convert T後のステータス確認)
-// 外部電源使用時、デバイスは温度変換中に 0 を出力し、完了すると 1 を出力し続けます。
+bool DS18B20::startConversion() {
+    if (!_mutex) return false;
+    bool success = false;
+    if (xSemaphoreTake(_mutex, portMAX_DELAY) == pdTRUE) {
+        success = startConversion_internal();
+        xSemaphoreGive(_mutex);
+    }
+    return success;
+}
+
+bool DS18B20::isConversionComplete_internal() {
+    return (ow_read_bit() == 1);
+}
+
 bool DS18B20::isConversionComplete() {
     if (!_mutex) return false;
-    
     bool complete = false;
     if (xSemaphoreTake(_mutex, portMAX_DELAY) == pdTRUE) {
-        // リードタイムスロットを実行し、結果が1になれば完了
-        complete = (ow_read_bit() == 1);
+        complete = isConversionComplete_internal();
         xSemaphoreGive(_mutex);
     }
     return complete;
 }
 
-bool DS18B20::readTemperature(int romIndex, float &tempCelsius) {
-    if (!_mutex || romIndex < 0 || romIndex >= _deviceCount) return false;
+bool DS18B20::readTemperature_internal(int romIndex, float &tempCelsius) {
+    if (romIndex < 0 || romIndex >= _deviceCount) return false;
+    _lastErrors[romIndex] = ERR_NONE;
 
+    // 詳細なバス診断を伴うリセット
+    ErrorType busErr = ERR_NONE;
+    if (!ow_reset_with_diagnosis(busErr)) {
+        _lastErrors[romIndex] = busErr;
+        return false;
+    }
+
+    ow_select(_devices[romIndex]);
+    ow_write_byte(0xBE); // Read Scratchpad
+
+    uint8_t scratchpad[9];
+    for (int i = 0; i < 9; i++) {
+        scratchpad[i] = ow_read_byte();
+    }
+
+    // バスのショート判定（全バイト 0x00 の場合）
+    bool allZeros = true;
+    for (int i = 0; i < 9; i++) {
+        if (scratchpad[i] != 0x00) {
+            allZeros = false;
+            break;
+        }
+    }
+    if (allZeros) {
+        _lastErrors[romIndex] = ERR_SHORT_GND;
+        return false;
+    }
+
+    // バスの断線判定（全バイト 0xFF の場合）
+    bool allOnes = true;
+    for (int i = 0; i < 9; i++) {
+        if (scratchpad[i] != 0xFF) {
+            allOnes = false;
+            break;
+        }
+    }
+    if (allOnes) {
+        _lastErrors[romIndex] = ERR_DISCONNECTED;
+        return false;
+    }
+
+    // --- 全エラー検知：データシート仕様に基づくスクラッチパッド予約領域・整合性チェック ---
+    // 1. Byte 5 は Reserved (常に 0xFF) である必要があります
+    if (scratchpad[5] != 0xFF) {
+        _lastErrors[romIndex] = ERR_MEM_CORRUPT;
+        return false;
+    }
+    
+    // 2. Byte 7 は Reserved (常に 0x10) である必要があります
+    if (scratchpad[7] != 0x10) {
+        _lastErrors[romIndex] = ERR_MEM_CORRUPT;
+        return false;
+    }
+
+    // 3. Byte 4 (Configuration Register) の下位5ビットは常に 11111 (0x1F) である必要があります (Figure 10参照)
+    if ((scratchpad[4] & 0x1F) != 0x1F) {
+        _lastErrors[romIndex] = ERR_MEM_CORRUPT;
+        return false;
+    }
+
+    // 4. データシート基準のCRC-8検証
+    if (calculateCRC8(scratchpad, 8) != scratchpad[8]) {
+        _lastErrors[romIndex] = ERR_CRC;
+        return false;
+    }
+
+    // スクラッチパッドから温度を算出
+    tempCelsius = calculateTemperature(scratchpad[0], scratchpad[1], scratchpad[4]);
+    
+    // 5. ハードウェア測定限界値（-55.0℃ 〜 +125.0℃）の範囲外判定
+    if (tempCelsius < -55.0f || tempCelsius > 125.0f) {
+        _lastErrors[romIndex] = ERR_OUT_OF_RANGE;
+        return false;
+    }
+
+    // 6. 85℃初期値固着 (未変換または電源寸断によるリセット検知)
+    if (tempCelsius == 85.0f) {
+        // スクラッチパッドのバイト6（予約領域）は、パワーオンリセット初期状態では 0x0C となっています。
+        // これにより、実際の「測定環境が正常に85.0℃」なのか「リセットによる85.0℃」かを切り分けます。
+        if (scratchpad[6] == 0x0C) {
+            // デバイス個別の電源供給モードをその場で再確認
+            bool isParasite = false;
+            if (ow_reset()) {
+                ow_select(_devices[romIndex]);
+                ow_write_byte(0xB4);
+                if (ow_read_bit() == 0) {
+                    isParasite = true;
+                    _parasitePowerDetected[romIndex] = true;
+                } else {
+                    _parasitePowerDetected[romIndex] = false;
+                }
+            }
+            
+            if (isParasite) {
+                _lastErrors[romIndex] = ERR_PARASITE_POWER;
+            } else {
+                _lastErrors[romIndex] = ERR_STUCK_85C;
+            }
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool DS18B20::readTemperature(int romIndex, float &tempCelsius) {
+    if (!_mutex) return false;
     bool success = false;
     if (xSemaphoreTake(_mutex, portMAX_DELAY) == pdTRUE) {
-        _lastErrors[romIndex] = ERR_NONE;
-
-        // 詳細なバス診断を伴うリセット
-        ErrorType busErr = ERR_NONE;
-        if (!ow_reset_with_diagnosis(busErr)) {
-            _lastErrors[romIndex] = busErr;
-            xSemaphoreGive(_mutex);
-            return false;
-        }
-
-        ow_select(_devices[romIndex]);
-        ow_write_byte(0xBE); // Read Scratchpad
-
-        uint8_t scratchpad[9];
-        for (int i = 0; i < 9; i++) {
-            scratchpad[i] = ow_read_byte();
-        }
-
-        // バスのショート判定（全バイト 0x00 の場合）
-        bool allZeros = true;
-        for (int i = 0; i < 9; i++) {
-            if (scratchpad[i] != 0x00) {
-                allZeros = false;
-                break;
-            }
-        }
-        if (allZeros) {
-            _lastErrors[romIndex] = ERR_SHORT_GND;
-            xSemaphoreGive(_mutex);
-            return false;
-        }
-
-        // バスの断線判定（全バイト 0xFF の場合）
-        bool allOnes = true;
-        for (int i = 0; i < 9; i++) {
-            if (scratchpad[i] != 0xFF) {
-                allOnes = false;
-                break;
-            }
-        }
-        if (allOnes) {
-            _lastErrors[romIndex] = ERR_DISCONNECTED;
-            xSemaphoreGive(_mutex);
-            return false;
-        }
-
-        // --- 全エラー検知：データシート仕様に基づくスクラッチパッド予約領域・整合性チェック ---
-        // 1. Byte 5 は Reserved (常に 0xFF) である必要があります
-        if (scratchpad[5] != 0xFF) {
-            _lastErrors[romIndex] = ERR_MEM_CORRUPT;
-            xSemaphoreGive(_mutex);
-            return false;
-        }
-        
-        // 2. Byte 7 は Reserved (常に 0x10) である必要があります
-        if (scratchpad[7] != 0x10) {
-            _lastErrors[romIndex] = ERR_MEM_CORRUPT;
-            xSemaphoreGive(_mutex);
-            return false;
-        }
-
-        // 3. Byte 4 (Configuration Register) の下位5ビットは常に 11111 (0x1F) である必要があります (Figure 10参照)
-        if ((scratchpad[4] & 0x1F) != 0x1F) {
-            _lastErrors[romIndex] = ERR_MEM_CORRUPT;
-            xSemaphoreGive(_mutex);
-            return false;
-        }
-
-        // 4. データシート基準のCRC-8検証
-        if (calculateCRC8(scratchpad, 8) != scratchpad[8]) {
-            _lastErrors[romIndex] = ERR_CRC;
-            xSemaphoreGive(_mutex);
-            return false;
-        }
-
-        // スクラッチパッドから温度を算出
-        tempCelsius = calculateTemperature(scratchpad[0], scratchpad[1], scratchpad[4]);
-        
-        // 5. ハードウェア測定限界値（-55.0℃ 〜 +125.0℃）の範囲外判定
-        if (tempCelsius < -55.0f || tempCelsius > 125.0f) {
-            _lastErrors[romIndex] = ERR_OUT_OF_RANGE;
-            xSemaphoreGive(_mutex);
-            return false;
-        }
-
-        // 6. 85℃初期値固着 (未変換または電源寸断によるリセット検知)
-        if (tempCelsius == 85.0f) {
-            // スクラッチパッドのバイト6（予約領域）は、パワーオンリセット初期状態では 0x0C となっています。
-            // これにより、実際の「測定環境が正常に85.0℃」なのか「リセットによる85.0℃」かを切り分けます。
-            if (scratchpad[6] == 0x0C) {
-                if (_parasitePowerDetected) {
-                    _lastErrors[romIndex] = ERR_PARASITE_POWER;
-                } else {
-                    _lastErrors[romIndex] = ERR_STUCK_85C;
-                }
-                xSemaphoreGive(_mutex);
-                return false;
-            }
-        }
-
-        success = true;
+        success = readTemperature_internal(romIndex, tempCelsius);
         xSemaphoreGive(_mutex);
     }
     return success;
@@ -519,45 +529,51 @@ const char* DS18B20::getErrorString(ErrorType err) {
 
 // 3線式専用の動的な温度変換完了ポーリング待機処理
 bool DS18B20::readAllTemperatures(float *tempArray) {
-    if (!tempArray || _deviceCount == 0) return false;
+    if (!tempArray || _deviceCount == 0 || !_mutex) return false;
 
-    // 1. 温度変換開始
-    if (!startConversion()) return false;
-
-    // 2. 最大800msの間、10msごとに完了ステータスをポーリング
-    // (通常、室温付近では750msよりも早く、およそ600ms〜700msで完了します)
-    int timeout_ms = 800;
-    int elapsed_ms = 0;
-    bool completed = false;
-
-    while (elapsed_ms < timeout_ms) {
-        vTaskDelay(pdMS_TO_TICKS(10));
-        elapsed_ms += 10;
-        if (isConversionComplete()) {
-            completed = true;
-            break;
-        }
-    }
-
-    // タイムアウトした場合はエラーを設定
-    if (!completed) {
-        for (int i = 0; i < _deviceCount; i++) {
-            _lastErrors[i] = ERR_CONVERSION_TIMEOUT;
-            tempArray[i] = -999.0f;
-        }
-        return false;
-    }
-
-    // 3. 各センサーから順番にデータを読み出す
     bool atLeastOneSuccess = false;
-    for (int i = 0; i < _deviceCount; i++) {
-        float temp = -999.0f;
-        if (readTemperature(i, temp)) {
-            tempArray[i] = temp;
-            atLeastOneSuccess = true;
-        } else {
-            tempArray[i] = -999.0f;
+    if (xSemaphoreTake(_mutex, portMAX_DELAY) == pdTRUE) {
+        // 1. 温度変換開始
+        if (!startConversion_internal()) {
+            xSemaphoreGive(_mutex);
+            return false;
         }
+
+        // 2. 最大800msの間、10msごとに完了ステータスをポーリング
+        int timeout_ms = 800;
+        int elapsed_ms = 0;
+        bool completed = false;
+
+        while (elapsed_ms < timeout_ms) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            elapsed_ms += 10;
+            if (isConversionComplete_internal()) {
+                completed = true;
+                break;
+            }
+        }
+
+        // タイムアウトした場合はエラーを設定
+        if (!completed) {
+            for (int i = 0; i < _deviceCount; i++) {
+                _lastErrors[i] = ERR_CONVERSION_TIMEOUT;
+                tempArray[i] = -999.0f;
+            }
+            xSemaphoreGive(_mutex);
+            return false;
+        }
+
+        // 3. 各センサーから順番にデータを読み出す
+        for (int i = 0; i < _deviceCount; i++) {
+            float temp = -999.0f;
+            if (readTemperature_internal(i, temp)) {
+                tempArray[i] = temp;
+                atLeastOneSuccess = true;
+            } else {
+                tempArray[i] = -999.0f;
+            }
+        }
+        xSemaphoreGive(_mutex);
     }
     return atLeastOneSuccess;
 }

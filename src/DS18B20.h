@@ -4,7 +4,7 @@
 #include <Arduino.h>
 
 /**
- * @brief DS18B20 / DS18B20U+ 専用の温度測定管理クラス (ESP32-C3・3線式専用)
+ * @brief DS18B20 / DS18B20U+ 専用の温度測定管理クラス (ESP32・3線式専用)
  * 
  * FreeRTOS環境において、タイミングの精密なGPIO制御を行い、
  * 温度変換待ち時間に vTaskDelay() を用いて他のタスクを動作させます。
@@ -103,7 +103,6 @@ private:
     struct SearchState {
         uint8_t rom_number[8];
         int last_discrepancy;
-        int last_family_discrepancy;
         bool last_device_flag;
     };
 
@@ -121,8 +120,15 @@ private:
     uint8_t _pin;
     DeviceAddress _devices[MAX_DEVICES];
     int _deviceCount;
-    bool _parasitePowerDetected; // 寄生電源駆動のデバイスが検出されたかどうかのフラグ
+    bool _parasitePowerDetected[MAX_DEVICES]; // 各デバイスが寄生電源駆動であるかどうかのフラグ
     SemaphoreHandle_t _mutex;  // 複数タスクからのアクセスを保護するためのMutex
+
+    // 内部用（Mutex保護なし）の処理メソッド
+    bool begin_internal();
+    bool startConversion_internal();
+    bool isConversionComplete_internal();
+    bool readTemperature_internal(int romIndex, float &tempCelsius);
+    bool checkPowerSupply_internal();
 
 public:
     /**

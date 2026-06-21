@@ -113,7 +113,7 @@ void vSensorTask(void *pvParameters) {
  * FreeRTOSの並行処理が正常に機能していることをシリアル出力で実証します。
  */
 void vHeartbeatTask(void *pvParameters) {
-    // ESP32-C3-WROOM-02-N4 などのモジュールを使用し、オンボードLEDなどが搭載されていない前提です。
+    // 一般的なESP32モジュールを使用し、オンボードLEDなどが搭載されていない前提です。
     // そのためGPIO制御は行わず、シリアル出力のみで並行動作を確認します。
     while (true) {
         // タイムスタンプ付きでシリアルに生存シグナルを出力
@@ -125,14 +125,14 @@ void vHeartbeatTask(void *pvParameters) {
 
 void setup() {
     Serial.begin(115200);
-    // ESP32-C3のシリアル通信準備完了を少し待つ
+    // ESP32のシリアル通信準備完了を少し待つ
     delay(1000);
     Serial.println("\n");
     Serial.println("==================================================");
-    Serial.println(" ESP32-C3 DS18B20 RMT & FreeRTOS 制御プログラム");
+    Serial.println(" ESP32 DS18B20 & FreeRTOS 制御プログラム");
     Serial.println("==================================================");
     Serial.println("※3線式(外部電源モード)専用設計。バスエラー検知＆診断機能付き。");
-    Serial.println("※RMTハードウェアとvTaskDelay()により、RTOSへの悪影響を排除しています。");
+    Serial.println("※タイミング制御とvTaskDelay()により、RTOSへの悪影響を排除しています。");
 
     // 1. センサータスクの生成 (優先度: 2)
     xTaskCreate(
