@@ -2,12 +2,11 @@
 #define DS18B20_H
 
 #include <Arduino.h>
-#include "OneWireNg_CurrentPlatform.h"
 
 /**
- * @brief DS18B20 / DS18B20U+ 専用の温度測定管理クラス (ESP32-C3 RMT対応・3線式専用)
+ * @brief DS18B20 / DS18B20U+ 専用の温度測定管理クラス (ESP32-C3・3線式専用)
  * 
- * FreeRTOS環境において、RMTハードウェアを使用した非ブロッキング通信を行い、
+ * FreeRTOS環境において、タイミングの精密なGPIO制御を行い、
  * 温度変換待ち時間（750ms）に vTaskDelay() を用いて他のタスクを動作させます。
  * バスの異常検知機能、電源断検出機能を内蔵しています。
  */
@@ -77,8 +76,25 @@ public:
     bool checkPowerSupply();
 
 private:
+    // 1-Wire 探索状態管理構造体
+    struct SearchState {
+        uint8_t rom_number[8];
+        int last_discrepancy;
+        int last_family_discrepancy;
+        bool last_device_flag;
+    };
+
+    // 1-Wire 低レベル通信関数
+    void ow_write_bit(uint8_t bit);
+    uint8_t ow_read_bit();
+    void ow_write_byte(uint8_t byte);
+    uint8_t ow_read_byte();
+    bool ow_reset();
+    void ow_select(const DeviceAddress addr);
+    void ow_skip();
+    bool search(DeviceAddress &address, SearchState &state);
+
     uint8_t _pin;
-    OneWireNg *_ow;
     DeviceAddress _devices[MAX_DEVICES];
     int _deviceCount;
     bool _parasitePowerDetected; // 寄生電源駆動のデバイスが検出されたかどうかのフラグ

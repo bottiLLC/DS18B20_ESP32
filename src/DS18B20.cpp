@@ -1,6 +1,9 @@
 #include "DS18B20.h"
 #include <string.h>
 
+// ESP32のタイミングにクリティカルな処理のためのスピンロック
+static portMUX_TYPE owMux = portMUX_INITIALIZER_UNLOCKED;
+
 // データシート Figure 11 (CRC Generator) に基づく 1-Wire CRC-8 の計算ルーチン
 // 生成多項式: X^8 + X^5 + X^4 + 1 (ビット反転表現: 0x8C)
 static uint8_t calculateCRC8(const uint8_t *data, size_t len) {
@@ -20,7 +23,7 @@ static uint8_t calculateCRC8(const uint8_t *data, size_t len) {
 }
 
 DS18B20::DS18B20(uint8_t pin) 
-    : _pin(pin), _ow(NULL), _deviceCount(0), _parasitePowerDetected(false) 
+    : _pin(pin), _deviceCount(0), _parasitePowerDetected(false) 
 {
     // スレッド安全性のためのミューテックスを作成
     _mutex = xSemaphoreCreateMutex();
@@ -30,12 +33,179 @@ DS18B20::DS18B20(uint8_t pin)
 }
 
 DS18B20::~DS18B20() {
-    if (_ow) {
-        delete _ow;
-    }
     if (_mutex) {
         vSemaphoreDelete(_mutex);
     }
+}
+
+// 1-Wire 低レベル通信関数
+
+void DS18B20::ow_write_bit(uint8_t bit) {
+    portENTER_CRITICAL(&owMux);
+    pinMode(_pin, OUTPUT);
+    digitalWrite(_pin, LOW);
+    if (bit) {
+        delayMicroseconds(5);  // Write 1: LOW 5us
+        pinMode(_pin, INPUT);  // リリース (プルアップでHIGH)
+        delayMicroseconds(55); // 残りの時間を待機
+    } else {
+        delayMicroseconds(60); // Write 0: LOW 60us
+        pinMode(_pin, INPUT);  // リリース
+        delayMicroseconds(5);  // 回復時間
+    }
+    portEXIT_CRITICAL(&owMux);
+}
+
+uint8_t DS18B20::ow_read_bit() {
+    uint8_t bit = 0;
+    portENTER_CRITICAL(&owMux);
+    pinMode(_pin, OUTPUT);
+    digitalWrite(_pin, LOW);
+    delayMicroseconds(2);      // Read slot: LOW 2us
+    pinMode(_pin, INPUT);      // リリース
+    delayMicroseconds(10);     // 10us待機してサンプリング (合計12us時点)
+    if (digitalRead(_pin)) {
+        bit = 1;
+    }
+    delayMicroseconds(48);     // タイムスロットの残りを待機 (合計60us)
+    portEXIT_CRITICAL(&owMux);
+    return bit;
+}
+
+void DS18B20::ow_write_byte(uint8_t byte) {
+    for (uint8_t i = 0; i < 8; i++) {
+        ow_write_bit(byte & 0x01);
+        byte >>= 1;
+    }
+}
+
+uint8_t DS18B20::ow_read_byte() {
+    uint8_t byte = 0;
+    for (uint8_t i = 0; i < 8; i++) {
+        byte >>= 1;
+        if (ow_read_bit()) {
+            byte |= 0x80;
+        }
+    }
+    return byte;
+}
+
+bool DS18B20::ow_reset() {
+    uint8_t presence = 0;
+    
+    // リセットパルス: LOW 480us
+    pinMode(_pin, OUTPUT);
+    digitalWrite(_pin, LOW);
+    delayMicroseconds(480);
+    
+    // バスをリリースしてデバイスの応答を待つ
+    portENTER_CRITICAL(&owMux);
+    pinMode(_pin, INPUT);
+    delayMicroseconds(70); // デバイスは15〜60us以内にDQをLOWに引くので、70us時点で確認
+    if (!digitalRead(_pin)) {
+        presence = 1;
+    }
+    portEXIT_CRITICAL(&owMux);
+    
+    delayMicroseconds(410); // 残りの復旧時間 (合計480us)
+    return (presence == 1);
+}
+
+void DS18B20::ow_select(const DeviceAddress addr) {
+    ow_write_byte(0x55); // Match ROM
+    for (int i = 0; i < 8; i++) {
+        ow_write_byte(addr[i]);
+    }
+}
+
+void DS18B20::ow_skip() {
+    ow_write_byte(0xCC); // Skip ROM
+}
+
+// 1-Wire Search ROM アルゴリズムの実装
+bool DS18B20::search(DeviceAddress &address, SearchState &state) {
+    uint8_t id_bit_number = 1;
+    uint8_t last_zero = 0;
+    uint8_t rom_byte_number = 0;
+    uint8_t rom_byte_mask = 1;
+    bool search_result = false;
+    uint8_t id_bit, cmp_id_bit;
+    uint8_t search_direction;
+
+    if (!state.last_device_flag) {
+        if (!ow_reset()) {
+            state.last_discrepancy = 0;
+            state.last_device_flag = false;
+            state.last_family_discrepancy = 0;
+            return false;
+        }
+
+        ow_write_byte(0xF0); // SEARCH ROM
+
+        do {
+            id_bit = ow_read_bit();
+            cmp_id_bit = ow_read_bit();
+
+            if ((id_bit == 1) && (cmp_id_bit == 1)) {
+                // デバイス応答なし
+                break;
+            } else {
+                if (id_bit != cmp_id_bit) {
+                    search_direction = id_bit;
+                } else {
+                    if (id_bit_number < state.last_discrepancy) {
+                        search_direction = ((state.rom_number[rom_byte_number] & rom_byte_mask) > 0);
+                    } else {
+                        search_direction = (id_bit_number == state.last_discrepancy);
+                    }
+
+                    if (search_direction == 0) {
+                        last_zero = id_bit_number;
+                        if (last_zero < 9) {
+                            state.last_family_discrepancy = last_zero;
+                        }
+                    }
+                }
+
+                if (search_direction == 1) {
+                    state.rom_number[rom_byte_number] |= rom_byte_mask;
+                } else {
+                    state.rom_number[rom_byte_number] &= ~rom_byte_mask;
+                }
+
+                ow_write_bit(search_direction);
+
+                id_bit_number++;
+                rom_byte_mask <<= 1;
+
+                if (rom_byte_mask == 0) {
+                    rom_byte_number++;
+                    rom_byte_mask = 1;
+                }
+            }
+        } while (rom_byte_number < 8);
+
+        if (!(id_bit_number < 65)) {
+            state.last_discrepancy = last_zero;
+            if (state.last_discrepancy == 0) {
+                state.last_device_flag = true;
+            }
+            search_result = true;
+        }
+    }
+
+    if (!search_result || (state.rom_number[0] == 0)) {
+        state.last_discrepancy = 0;
+        state.last_device_flag = false;
+        state.last_family_discrepancy = 0;
+        search_result = false;
+    } else {
+        for (int i = 0; i < 8; i++) {
+            address[i] = state.rom_number[i];
+        }
+    }
+
+    return search_result;
 }
 
 bool DS18B20::begin() {
@@ -48,48 +218,43 @@ bool DS18B20::begin() {
             _lastErrors[i] = ERR_NONE;
         }
 
-        // インスタンスがなければ生成する（再呼び出し時のヒープ断片化防止）
-        if (!_ow) {
-            _ow = new OneWireNg_CurrentPlatform(_pin, false);
+        // 初期状態でバスピンをプルアップの浮いた入力状態にする
+        pinMode(_pin, INPUT);
+
+        SearchState s_state;
+        memset(&s_state, 0, sizeof(SearchState));
+        s_state.last_discrepancy = 0;
+        s_state.last_device_flag = false;
+        s_state.last_family_discrepancy = 0;
+
+        DeviceAddress addr;
+
+        while (search(addr, s_state)) {
+            if (_deviceCount >= MAX_DEVICES) break;
+
+            // DS18B20ファミリーコード 0x28 の検証
+            // 自前の CRC-8 算出で ROM の整合性を検査
+            if (addr[0] == 0x28 && calculateCRC8(addr, 7) == addr[7]) {
+                memcpy(_devices[_deviceCount], addr, 8);
+                _lastErrors[_deviceCount] = ERR_NONE;
+                _deviceCount++;
+            }
         }
-        
-        if (_ow) {
-            // バスリセットを試み、応答がなければ即座に終了する
-            if (_ow->reset() != OneWireNg::EC_SUCCESS) {
-                xSemaphoreGive(_mutex);
-                return false;
-            }
 
-            // バス上のデバイスをスキャンしてDS18B20のみを抽出
-            // OneWireNgのイテレータを使用
-            for (const auto& id : *_ow) {
-                if (_deviceCount >= MAX_DEVICES) break;
-
-                // バイト0はファミリーコード。DS18B20 / DS18B20U+ は 0x28 (データシート参照)
-                // 通信ノイズ対策として、ROMアドレスのCRC8も検証する
-                if (id[0] == 0x28 && OneWireNg::checkCrcId(id) == OneWireNg::EC_SUCCESS) {
-                    for (int i = 0; i < 8; i++) {
-                        _devices[_deviceCount][i] = id[i];
-                    }
-                    _lastErrors[_deviceCount] = ERR_NONE;
-                    _deviceCount++;
-                }
-            }
-
-            // デバイスが検出された場合、電源供給モード（3線モード）の確認を行う
-            if (_deviceCount > 0) {
-                if (_ow->reset() == OneWireNg::EC_SUCCESS) {
-                    _ow->addressAll();
-                    _ow->writeByte(0xB4); // Read Power Supply コマンド
-                    // 0が返ってきた場合は、少なくとも1台が寄生電源動作（VDDピン断線の疑い）
-                    if (_ow->readBit() == 0) {
-                        _parasitePowerDetected = true;
-                    } else {
-                        _parasitePowerDetected = false;
-                    }
+        // 電源供給モード（3線モード）の確認を行う
+        if (_deviceCount > 0) {
+            if (ow_reset()) {
+                ow_skip();
+                ow_write_byte(0xB4); // Read Power Supply コマンド
+                // 0が返ってきた場合は、少なくとも1台が寄生電源動作
+                if (ow_read_bit() == 0) {
+                    _parasitePowerDetected = true;
+                } else {
+                    _parasitePowerDetected = false;
                 }
             }
         }
+
         xSemaphoreGive(_mutex);
         return (_deviceCount > 0);
     }
@@ -97,14 +262,14 @@ bool DS18B20::begin() {
 }
 
 bool DS18B20::checkPowerSupply() {
-    if (!_ow || !_mutex) return false;
+    if (!_mutex) return false;
 
     bool allExternal = true;
     if (xSemaphoreTake(_mutex, portMAX_DELAY) == pdTRUE) {
-        if (_ow->reset() == OneWireNg::EC_SUCCESS) {
-            _ow->addressAll();
-            _ow->writeByte(0xB4);
-            if (_ow->readBit() == 0) {
+        if (ow_reset()) {
+            ow_skip();
+            ow_write_byte(0xB4);
+            if (ow_read_bit() == 0) {
                 _parasitePowerDetected = true;
                 allExternal = false;
             } else {
@@ -120,19 +285,16 @@ bool DS18B20::checkPowerSupply() {
 }
 
 bool DS18B20::startConversion() {
-    if (!_ow || !_mutex) return false;
+    if (!_mutex) return false;
 
     if (xSemaphoreTake(_mutex, portMAX_DELAY) == pdTRUE) {
-        // バスリセットを試み、失敗した場合は即座に終了する
-        if (_ow->reset() != OneWireNg::EC_SUCCESS) {
+        if (!ow_reset()) {
             xSemaphoreGive(_mutex);
             return false;
         }
 
-        // バス上のすべてのデバイスに対して一斉に温度変換を開始する
-        // OneWireNgの最適化APIを使用してSkip ROMを実行
-        _ow->addressAll();
-        _ow->writeByte(0x44); // Convert T (データシート: 温度変換開始コマンド)
+        ow_skip();
+        ow_write_byte(0x44); // Convert T
         
         xSemaphoreGive(_mutex);
         return true;
@@ -141,31 +303,25 @@ bool DS18B20::startConversion() {
 }
 
 bool DS18B20::readTemperature(int romIndex, float &tempCelsius) {
-    if (!_ow || !_mutex || romIndex < 0 || romIndex >= _deviceCount) return false;
+    if (!_mutex || romIndex < 0 || romIndex >= _deviceCount) return false;
 
     bool success = false;
     if (xSemaphoreTake(_mutex, portMAX_DELAY) == pdTRUE) {
         _lastErrors[romIndex] = ERR_NONE;
 
-        // バスリセットを試み、失敗した場合は即座に終了する
-        if (_ow->reset() != OneWireNg::EC_SUCCESS) {
+        if (!ow_reset()) {
             _lastErrors[romIndex] = ERR_BUS_RESET;
             xSemaphoreGive(_mutex);
             return false;
         }
 
-        // OneWireNgの最適化APIを使用してMatch ROMを実行
-        if (_ow->addressSingle(_devices[romIndex]) != OneWireNg::EC_SUCCESS) {
-            _lastErrors[romIndex] = ERR_MATCH_ROM;
-            xSemaphoreGive(_mutex);
-            return false;
-        }
-        
-        _ow->writeByte(0xBE); // Read Scratchpad (データシート: スクラッチパッド読出)
+        ow_select(_devices[romIndex]);
+        ow_write_byte(0xBE); // Read Scratchpad
 
-        // スクラッチパッドデータ (9バイト) を一括で読み出す (readBytesによる最適化)
         uint8_t scratchpad[9];
-        _ow->readBytes(scratchpad, 9);
+        for (int i = 0; i < 9; i++) {
+            scratchpad[i] = ow_read_byte();
+        }
 
         // バスのショート判定（全バイト 0x00 の場合、バスがGNDに短絡していると判定）
         bool allZeros = true;
@@ -196,22 +352,15 @@ bool DS18B20::readTemperature(int romIndex, float &tempCelsius) {
         }
 
         // データシート基準のCRC-8検証
-        // 9バイトすべてのCRC計算結果が0になればデータ破損がないことを示す
-        if (calculateCRC8(scratchpad, 9) != 0) {
+        if (calculateCRC8(scratchpad, 8) != scratchpad[8]) {
             _lastErrors[romIndex] = ERR_CRC;
             xSemaphoreGive(_mutex);
             return false;
         }
 
-        // スクラッチパッドのバイト0(LSB), バイト1(MSB), バイト4(CFG)を抽出して温度計算
         tempCelsius = calculateTemperature(scratchpad[0], scratchpad[1], scratchpad[4]);
         
-        // 85℃固定出力問題（初期値エラーまたは未完了エラー）の検出と処理
         if (tempCelsius == 85.0f) {
-            // スクラッチパッドのバイト6（予約領域）は、パワーオンリセット初期状態では 0x0C となっています。
-            // 温度変換が一度も行われていないか、あるいは給電寸断でセンサーが再起動した場合は 0x0C のままです。
-            // 一度でも温度変換が正常に行われると、バイト6は温度に応じた動的な値（カウント残値）に更新されます。
-            // これにより、実際の「正常な85.0℃」と「起動直後/異常リセットの85.0℃」を正確に区別できます。
             if (scratchpad[6] == 0x0C) {
                 if (_parasitePowerDetected) {
                     _lastErrors[romIndex] = ERR_PARASITE_POWER;
@@ -264,15 +413,10 @@ const char* DS18B20::getErrorString(ErrorType err) {
 bool DS18B20::readAllTemperatures(float *tempArray) {
     if (!tempArray || _deviceCount == 0) return false;
 
-    // 1. 温度変換開始 (非同期コマンド送信)
     if (!startConversion()) return false;
 
-    // 2. データシートに基づく変換待機
-    // 12bit解像度時の最大変換時間は 750ms。RTOSのタスクを yield して他のタスクに時間を与える。
-    // マージンをとって 780ms 待機。
     vTaskDelay(pdMS_TO_TICKS(780));
 
-    // 3. 各センサーから順番にデータを読み出す
     bool atLeastOneSuccess = false;
     for (int i = 0; i < _deviceCount; i++) {
         float temp = -999.0f;
@@ -280,7 +424,7 @@ bool DS18B20::readAllTemperatures(float *tempArray) {
             tempArray[i] = temp;
             atLeastOneSuccess = true;
         } else {
-            tempArray[i] = -999.0f; // エラー値
+            tempArray[i] = -999.0f;
         }
     }
     return atLeastOneSuccess;
@@ -295,25 +439,16 @@ void DS18B20::getDeviceAddress(int romIndex, DeviceAddress destAddress) const {
 }
 
 float DS18B20::calculateTemperature(uint8_t lsb, uint8_t msb, uint8_t cfg) {
-    // データシート Figure 4 (Temperature Register Format) に基づく算出
-    // LSBとMSBを合わせた16bit符号付き2の補数表現を取得
     int16_t raw = (msb << 8) | lsb;
 
-    // デバイス解像度（設定レジスタのビット6:5 (R1, R0)）に基づき未定義ビットをマスク
-    // 00: 9-bit (下位3ビット未定義)
-    // 01: 10-bit (下位2ビット未定義)
-    // 10: 11-bit (下位1ビット未定義)
-    // 11: 12-bit (全ビット有効)
     uint8_t res = (cfg >> 5) & 0x03;
     if (res == 0x00) {
-        raw &= ~0x07; // 下位3ビットをクリア
+        raw &= ~0x07;
     } else if (res == 0x01) {
-        raw &= ~0x03; // 下位2ビットをクリア
+        raw &= ~0x03;
     } else if (res == 0x02) {
-        raw &= ~0x01; // 下位1ビットをクリア
+        raw &= ~0x01;
     }
 
-    // 12bit解像度時の重みは 1/16℃ (0.0625℃) (データシート Table 1)
-    // 16.0f で割ることで小数点以下の温度を正しく復元
     return (float)raw / 16.0f;
 }
