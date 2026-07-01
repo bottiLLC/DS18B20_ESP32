@@ -1,5 +1,7 @@
 #include "DS18B20.h"
 #include <string.h>
+#include "soc/gpio_struct.h"
+#include "soc/gpio_reg.h"
 
 // ESP32のタイミングにクリティカルな処理のためのスピンロック
 static portMUX_TYPE owMux = portMUX_INITIALIZER_UNLOCKED;
