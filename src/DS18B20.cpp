@@ -47,18 +47,18 @@ void DS18B20::ow_write_bit(uint8_t bit) {
     const uint32_t pin_mask = (1UL << _pin);
     if (bit) {
         portENTER_CRITICAL(&owMux);
-        GPIO.out_w1tc = pin_mask;     // 常にLOWに落とす準備
-        GPIO.enable_w1ts = pin_mask;   // OUTPUT有効 (バスをLOWへ)
+        GPIO.out_w1tc.val = pin_mask;     // 常にLOWに落とす準備
+        GPIO.enable_w1ts.val = pin_mask;   // OUTPUT有効 (バスをLOWへ)
         delayMicroseconds(5);          // Write 1: LOW 5us
-        GPIO.enable_w1tc = pin_mask;   // OUTPUT無効 (リリース、プルアップによりHIGHへ)
+        GPIO.enable_w1tc.val = pin_mask;   // OUTPUT無効 (リリース、プルアップによりHIGHへ)
         portEXIT_CRITICAL(&owMux);
         delayMicroseconds(55);         // 残りの時間は割り込みを許可して待機
     } else {
         portENTER_CRITICAL(&owMux);
-        GPIO.out_w1tc = pin_mask;     // 常にLOWに落とす準備
-        GPIO.enable_w1ts = pin_mask;   // OUTPUT有効 (バスをLOWへ)
+        GPIO.out_w1tc.val = pin_mask;     // 常にLOWに落とす準備
+        GPIO.enable_w1ts.val = pin_mask;   // OUTPUT有効 (バスをLOWへ)
         delayMicroseconds(60);         // Write 0: LOW 60us
-        GPIO.enable_w1tc = pin_mask;   // OUTPUT無効 (リリース)
+        GPIO.enable_w1tc.val = pin_mask;   // OUTPUT無効 (リリース)
         portEXIT_CRITICAL(&owMux);
         delayMicroseconds(5);          // 回復時間は割り込みを許可して待機
     }
@@ -68,12 +68,12 @@ uint8_t DS18B20::ow_read_bit() {
     uint8_t bit = 0;
     const uint32_t pin_mask = (1UL << _pin);
     portENTER_CRITICAL(&owMux);
-    GPIO.out_w1tc = pin_mask;     // LOWに落とす準備
-    GPIO.enable_w1ts = pin_mask;   // OUTPUT有効 (Read開始: バスをLOWへ)
+    GPIO.out_w1tc.val = pin_mask;     // LOWに落とす準備
+    GPIO.enable_w1ts.val = pin_mask;   // OUTPUT有効 (Read開始: バスをLOWへ)
     delayMicroseconds(2);          // Read slot: LOW 2us
-    GPIO.enable_w1tc = pin_mask;   // OUTPUT無効 (リリース)
+    GPIO.enable_w1tc.val = pin_mask;   // OUTPUT無効 (リリース)
     delayMicroseconds(10);         // 10us待機してサンプリング (合計12us時点)
-    if (GPIO.in & pin_mask) {      // ピン状態の直接読み込み
+    if (GPIO.in.val & pin_mask) {      // ピン状態の直接読み込み
         bit = 1;
     }
     portEXIT_CRITICAL(&owMux);     // サンプリング直後に割り込みを許可
@@ -110,27 +110,27 @@ bool DS18B20::ow_reset_with_diagnosis(ErrorType &busError) {
     const uint32_t pin_mask = (1UL << _pin);
     
     // 1. 事前のバスレベル確認（プルアップによりHIGHになっているはず）
-    GPIO.enable_w1tc = pin_mask;   // INPUTモード
+    GPIO.enable_w1tc.val = pin_mask;   // INPUTモード
     delayMicroseconds(10);
-    if (!(GPIO.in & pin_mask)) {
+    if (!(GPIO.in.val & pin_mask)) {
         // すでにLOWになっている ＝ バスGNDショートの可能性
         busError = ERR_SHORT_GND;
         return false;
     }
 
     // 2. リセットパルスの送信 (LOW 480us)
-    GPIO.out_w1tc = pin_mask;     // LOWレベル準備
-    GPIO.enable_w1ts = pin_mask;   // OUTPUT有効
+    GPIO.out_w1tc.val = pin_mask;     // LOWレベル準備
+    GPIO.enable_w1ts.val = pin_mask;   // OUTPUT有効
     delayMicroseconds(480);
     
     // 3. リリースし、ピンの立ち上がりをタイミング保護下で確認
     portENTER_CRITICAL(&owMux);
-    GPIO.enable_w1tc = pin_mask;   // OUTPUT無効 (リリース)
+    GPIO.enable_w1tc.val = pin_mask;   // OUTPUT無効 (リリース)
     
     // デバイスがプレゼンスを送信し始める前のタイミング(10us後)で
     // バスが一旦HIGHへ立ち上がったかを確認（これで永続的なGNDショートを検出）
     delayMicroseconds(10);
-    if (!(GPIO.in & pin_mask)) {
+    if (!(GPIO.in.val & pin_mask)) {
         portEXIT_CRITICAL(&owMux);
         busError = ERR_SHORT_GND;
         return false;
@@ -139,7 +139,7 @@ bool DS18B20::ow_reset_with_diagnosis(ErrorType &busError) {
     // 4. プレゼンスパルス（デバイスがLOWに引く）のサンプリング
     // リリース開始から合計70us後（すでに10us経過しているため残り60us）
     delayMicroseconds(60); 
-    uint8_t presence = (GPIO.in & pin_mask) ? 1 : 0;
+    uint8_t presence = (GPIO.in.val & pin_mask) ? 1 : 0;
     portEXIT_CRITICAL(&owMux);
     
     // 5. リセットパルスのタイムスロット完了まで待機 (残り410us)
