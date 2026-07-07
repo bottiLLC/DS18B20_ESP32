@@ -21,6 +21,7 @@
 
 #include "DS18B20.h"
 #include <string.h>
+#include "soc/gpio_struct.h"
 #include "soc/gpio_reg.h"
 
 // ESP32シリーズ間の互換性維持のためのレジスタアクセス用マクロ
