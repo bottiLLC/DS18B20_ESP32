@@ -147,3 +147,7 @@ void loop() {
   今回作成した、最もシンプルに温度を読み取るためのコードです。ピン番号やセンサー数、測定間隔を簡単に変更できる構成になっています。
 * **`examples/ComprehensiveDemo/ComprehensiveDemo.ino`**:
   FreeRTOSタスクを生成し、バックグラウンドで並行して動作させる包括的なデモです。
+
+## ライセンス
+[MIT License](LICENSE)
+Copyright (c) 2026 Yoshimasa Fujisawa
