@@ -27,10 +27,12 @@
 // ESP32シリーズ間の互換性維持のためのレジスタアクセス用マクロ
 // 初代ESP32とそれ以外（C3/S3等）で構造体の定義（.valの有無）が異なるため、ここで吸収します
 #if defined(CONFIG_IDF_TARGET_ESP32)
-#define OW_REG_WRITE(reg, val) (reg = (val))
+// 初代ESP32 (ESP32-E含む) 用：.val は不要
+#define OW_REG_WRITE(reg, _val) (reg = (_val))
 #define OW_REG_READ(reg) (reg)
 #else
-#define OW_REG_WRITE(reg, val) (reg.val = (val))
+// ESP32-C3, S3, C6など用：.val が必要
+#define OW_REG_WRITE(reg, _val) (reg.val = (_val))
 #define OW_REG_READ(reg) (reg.val)
 #endif
 
